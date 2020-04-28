@@ -1,14 +1,17 @@
 """CNN-based image classification on SageMaker with TensorFlow and Keras
 
-REFERENCE SOLUTION IMPLEMENTATION
+Reference solution implementation modified for pipe mode to investigate:
+https://github.com/aws/sagemaker-tensorflow-extensions/issues/46
 """
 
 # Dependencies:
 import argparse
+import json
 import os
 
 import numpy as np
 from PIL import Image
+from sagemaker_tensorflow import PipeModeDataset
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D
@@ -23,98 +26,46 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=128)
 
     # Data, model, and output directories
+    hps = json.loads(os.environ.get("SM_HPS", {}))
     parser.add_argument("--output-data-dir", type=str, default=os.environ["SM_OUTPUT_DATA_DIR"])
     parser.add_argument("--model-dir", type=str, default=os.environ["SM_MODEL_DIR"])
     parser.add_argument("--train", type=str, default=os.environ["SM_CHANNEL_TRAIN"])
     parser.add_argument("--test", type=str, default=os.environ["SM_CHANNEL_TEST"])
 
+    parser.add_argument("--num-samples-train", type=int, default=hps.get("num-samples-train"))
+    parser.add_argument("--num-samples-test", type=int, default=hps.get("num-samples-test"))
+
     return parser.parse_known_args()
 
-# TODO: Other function definitions, if you'd like to break up your code?
+# TODO: Take number of total digits and image dimensions as params when the basics are working.
+def tf_mapper(fields):
+    img = tf.image.decode_image(fields[0], dtype=tf.dtypes.float32, channels=1) / 255.
+    # MNIST = all images already prepared to 28px square
+    img.set_shape((28, 28, 1))
+    
+    digit = tf.strings.to_number(fields[1], out_type=tf.dtypes.int32)
+    digit.set_shape([])
+    digit_onehot = tf.one_hot(digit, 10)
+    digit_onehot.set_shape([10,])
+
+    return img2, digit_onehot
+
 
 def load_data(args):
-    labels = sorted(os.listdir(args.train))
-    n_labels = len(labels)
-    x_train = []
-    y_train = []
-    x_test = []
-    y_test = []
-    print("Loading label ", end="")
-    for ix_label in range(n_labels):
-        label_str = labels[ix_label]
-        print(f"{label_str}...", end="")
-        trainfiles = filter(
-            lambda s: s.endswith(".jpg"),
-            os.listdir(os.path.join(args.train, label_str))
-        )
-        for filename in trainfiles:
-            # Can't just use tf.keras.preprocessing.image.load_img(), because it doesn't close its
-            # file handles! So get "Too many open files" error... Grr
-            with open(os.path.join(args.train, label_str, filename), "rb") as imgfile:
-                x_train.append(
-                    # Squeeze (drop) that extra channel dimension, to be consistent with prev
-                    # format:
-                    np.squeeze(tf.keras.preprocessing.image.img_to_array(
-                        Image.open(imgfile)
-                    ))
-                )
-                y_train.append(ix_label)
-        # Repeat for test data:
-        testfiles = filter(
-            lambda s: s.endswith(".jpg"),
-            os.listdir(os.path.join(args.test, label_str))
-        )
-        for filename in testfiles:
-            with open(os.path.join(args.test, label_str, filename), "rb") as imgfile:
-                x_test.append(
-                    np.squeeze(tf.keras.preprocessing.image.img_to_array(
-                        Image.open(imgfile)
-                    ))
-                )
-                y_test.append(ix_label)
-    print("Shuffling trainset...")
-    train_shuffled = [(x_train[ix], y_train[ix]) for ix in range(len(y_train))]
-    np.random.shuffle(train_shuffled)
+    ds_train = PipeModeDataset(channel="train") \
+        .repeat(args.epochs) \
+        .batch(2) \
+        .map(tf_mapper) \
+        .batch(args.batch_size, drop_remainder=True)
 
-    x_train = np.array([datum[0] for datum in train_shuffled])
-    y_train = np.array([datum[1] for datum in train_shuffled])
-    train_shuffled = None
+    ds_test = PipeModeDataset(channel="test") \
+        .repeat(args.epochs) \
+        .batch(2) \
+        .map(tf_mapper) \
+        .batch(args.batch_size, drop_remainder=True)
 
-    print("Shuffling testset...")
-    test_shuffled = [(x_test[ix], y_test[ix]) for ix in range(len(y_test))]
-    np.random.shuffle(test_shuffled)
+    return ds_train, ds_test
 
-    x_test = np.array([datum[0] for datum in test_shuffled])
-    y_test = np.array([datum[1] for datum in test_shuffled])
-    test_shuffled = None
-
-    if K.image_data_format() == "channels_first":
-        x_train = np.expand_dims(x_train, 1)
-        x_test = np.expand_dims(x_train, 1)
-    else:
-        x_train = np.expand_dims(x_train, len(x_train.shape))
-        x_test = np.expand_dims(x_test, len(x_test.shape))
-
-    x_train = x_train.astype("float32")
-    x_test = x_test.astype("float32")
-    x_train /= 255
-    x_test /= 255
-
-    input_shape = x_train.shape[1:]
-
-    print("x_train shape:", x_train.shape)
-    print("input_shape:", input_shape)
-    print(x_train.shape[0], "train samples")
-    print(x_test.shape[0], "test samples")
-
-    # convert class vectors to binary class matrices
-    y_train = tf.keras.utils.to_categorical(y_train, n_labels)
-    y_test = tf.keras.utils.to_categorical(y_test, n_labels)
-
-    print("n_labels:", n_labels)
-    print("y_train shape:", y_train.shape)
-
-    return x_train, y_train, x_test, y_test, input_shape, n_labels
 
 def build_model(input_shape, n_labels):
     model = Sequential()
@@ -135,34 +86,27 @@ def build_model(input_shape, n_labels):
 
     return model
 
+
 # Training script:
 if __name__ == "__main__":
-    # TODO: Load arguments from CLI / environment variables?
     args, _ = parse_args()
     print(args)
 
-    # TODO: Load images from container filesystem into training / test data sets?
-    x_train, y_train, x_test, y_test, input_shape, n_labels = load_data(args)
+    ds_train, ds_test = load_data(args)
 
-    # TODO: Create the Keras model?
-    model = build_model(input_shape, n_labels)
+    model = build_model((28, 28, 1), 10)
 
-    # TODO: Fit the Keras model?
     model.fit(
-        x_train, y_train,
-        batch_size=args.batch_size,
+        ds_train,
         epochs=args.epochs,
-        shuffle=True,
-        verbose=2, # Hint: You might prefer =2 for running in SageMaker!
-        validation_data=(x_test, y_test)
+        verbose=2,
+        shuffle=False,
+        steps_per_epoch=args.num_samples_train // args.batch_size,
+        validation_data=ds_test,
+        validation_steps=args.num_samples_test // args.batch_size,
     )
 
-    # TODO: Evaluate model quality and log metrics?
-    score = model.evaluate(x_test, y_test, verbose=0)
-    print(f"Test loss: {score[0]}")
-    print(f"Test accuracy: {score[1]}")
-
-    # TODO: Save outputs (trained model) to specified folder?
+    # Save outputs (trained model) to specified folder in TFServing-compatible format
     sess = K.get_session()
     tf.saved_model.simple_save(
         sess,
