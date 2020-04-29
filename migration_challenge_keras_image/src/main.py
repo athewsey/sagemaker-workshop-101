@@ -39,16 +39,16 @@ def parse_args():
 
 # TODO: Take number of total digits and image dimensions as params when the basics are working.
 def tf_mapper(fields):
-    img = tf.image.decode_image(fields[0], dtype=tf.dtypes.float32, channels=1) / 255.
+    img = tf.image.decode_image(fields[0], dtype=tf.float32, channels=1) / 255.
     # MNIST = all images already prepared to 28px square
     img.set_shape((28, 28, 1))
     
-    digit = tf.strings.to_number(fields[1], out_type=tf.dtypes.int32)
+    digit = tf.strings.to_number(fields[1], out_type=tf.int32)
     digit.set_shape([])
     digit_onehot = tf.one_hot(digit, 10)
     digit_onehot.set_shape([10,])
 
-    return img2, digit_onehot
+    return img, digit_onehot
 
 
 def load_data(args):
